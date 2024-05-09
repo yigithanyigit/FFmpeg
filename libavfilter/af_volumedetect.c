@@ -170,9 +170,43 @@ static void print_stats(AVFilterContext *ctx)
     }
 }
 
+static int config_output(AVFilterLink *outlink)
+{
+    AVFilterContext *ctx = outlink->src;
+    VolDetectContext *vd = ctx->priv;
+    size_t histogram_size;
+
+    vd->is_float = outlink->format == AV_SAMPLE_FMT_FLT ||
+                outlink->format == AV_SAMPLE_FMT_FLTP;
+
+    if (!vd->is_float) {
+        /*
+        * Number of samples at each PCM value.
+        * Only used for integer formats.
+        * For 16 bit signed PCM there are 65536.
+        * histogram[0x8000 + i] is the number of samples at value i.
+        * The extra element is there for symmetry.
+        */
+        histogram_size = HISTOGRAM_SIZE + 1;
+    } else {
+        /*
+        * The histogram is used to store the number of samples at each dB
+        * instead of the number of samples at each PCM value.
+        */
+        histogram_size = HISTOGRAM_SIZE_FLT + 1;
+    }
+    vd->histogram = av_calloc(histogram_size, sizeof(uint64_t));
+    if (!vd->histogram)
+        return AVERROR(ENOMEM);
+    return 0;
+}
+
 static av_cold void uninit(AVFilterContext *ctx)
 {
+    VolDetectContext *vd = ctx->priv;
     print_stats(ctx);
+    if (vd->histogram)
+        av_freep(&vd->histogram);
 }
 
 static const AVFilterPad volumedetect_inputs[] = {
@@ -183,6 +217,14 @@ static const AVFilterPad volumedetect_inputs[] = {
     },
 };
 
+static const AVFilterPad volumedetect_outputs[] = {
+    {
+        .name         = "default",
+        .type         = AVMEDIA_TYPE_AUDIO,
+        .config_props = config_output,
+    },
+};
+
 const AVFilter ff_af_volumedetect = {
     .name          = "volumedetect",
     .description   = NULL_IF_CONFIG_SMALL("Detect audio volume."),
@@ -190,6 +232,9 @@ const AVFilter ff_af_volumedetect = {
     .uninit        = uninit,
     .flags         = AVFILTER_FLAG_METADATA_ONLY,
     FILTER_INPUTS(volumedetect_inputs),
-    FILTER_OUTPUTS(ff_audio_default_filterpad),
-    FILTER_SAMPLEFMTS(AV_SAMPLE_FMT_S16, AV_SAMPLE_FMT_S16P),
+    FILTER_OUTPUTS(volumedetect_outputs),
+    FILTER_SAMPLEFMTS(AV_SAMPLE_FMT_S16,
+                    AV_SAMPLE_FMT_S16P,
+                    AV_SAMPLE_FMT_FLT,
+                    AV_SAMPLE_FMT_FLTP),
 };
