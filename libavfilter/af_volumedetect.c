@@ -42,22 +42,45 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *samples)
 {
     AVFilterContext *ctx = inlink->dst;
     VolDetectContext *vd = ctx->priv;
-    int nb_samples  = samples->nb_samples;
     int nb_channels = samples->ch_layout.nb_channels;
     int nb_planes   = nb_channels;
+    int nb_samples  = samples->nb_samples;
     int plane, i;
-    int16_t *pcm;
+    int planar = 0;
 
-    if (!av_sample_fmt_is_planar(samples->format)) {
-        nb_samples *= nb_channels;
+    planar = av_sample_fmt_is_planar(samples->format);
+    if (!planar)
         nb_planes = 1;
+    if (vd->is_float) {
+        float *audio_data;
+        for (plane = 0; plane < nb_planes; plane++) {
+            audio_data = (float *)samples->extended_data[plane];
+            for (i = 0; i < nb_samples; i++) {
+                if (planar) {
+                    update_float_stats(vd, &audio_data[i]);
+                } else {
+                    for (int j = 0; j < nb_channels; j++)
+                        update_float_stats(vd, &audio_data[i * nb_channels + j]);
+                }
+            }
+        }
+    } else {
+        int16_t *pcm;
+        for (plane = 0; plane < nb_planes; plane++) {
+            pcm = (int16_t *)samples->extended_data[plane];
+            for (i = 0; i < nb_samples; i++) {
+                if (planar) {
+                    vd->histogram[pcm[i] + 0x8000]++;
+                    vd->nb_samples++;
+                } else {
+                    for (int j = 0; j < nb_channels; j++) {
+                        vd->histogram[pcm[i * nb_channels + j] + 0x8000]++;
+                        vd->nb_samples++;
+                    }
+                }
+            }
+        }
     }
-    for (plane = 0; plane < nb_planes; plane++) {
-        pcm = (int16_t *)samples->extended_data[plane];
-        for (i = 0; i < nb_samples; i++)
-            vd->histogram[pcm[i] + 0x8000]++;
-    }
-
     return ff_filter_frame(inlink->dst->outputs[0], samples);
 }
 
