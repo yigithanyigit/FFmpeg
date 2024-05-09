@@ -61,6 +61,7 @@ typedef struct LIBVMAFContext {
     unsigned model_cnt;
     unsigned frame_cnt;
     unsigned bpc;
+    int is_propagation_finished;
 #if CONFIG_LIBVMAF_CUDA_FILTER
     VmafCudaState *cu_state;
 #endif
@@ -126,12 +127,19 @@ static int copy_picture_data(AVFrame *src, VmafPicture *dst, unsigned bpc)
     return 0;
 }
 
+static void set_meta(AVDictionary **metadata, const char *key, const char *val)
+{
+    av_dict_set(metadata, key, val, 0);
+}
+
 static int do_vmaf(FFFrameSync *fs)
 {
     AVFilterContext *ctx = fs->parent;
     LIBVMAFContext *s = ctx->priv;
     VmafPicture pic_ref, pic_dist;
     AVFrame *ref, *dist;
+    AVDictionary *metadata;
+    AVDictionaryEntry *entry;
     int err = 0;
 
     int ret = ff_framesync_dualinput_get(fs, &dist, &ref);
@@ -139,6 +147,7 @@ static int do_vmaf(FFFrameSync *fs)
         return ret;
     if (ctx->is_disabled || !ref)
         return ff_filter_frame(ctx->outputs[0], dist);
+    metadata = NULL;
 
     if (dist->color_range != ref->color_range) {
         av_log(ctx, AV_LOG_WARNING, "distorted and reference "
@@ -160,10 +169,22 @@ static int do_vmaf(FFFrameSync *fs)
         return AVERROR(ENOMEM);
     }
 
-    err = vmaf_read_pictures(s->vmaf, &pic_ref, &pic_dist, s->frame_cnt++);
+    err = vmaf_read_pictures(s->vmaf, &pic_ref, &pic_dist, s->frame_cnt);
     if (err) {
         av_log(s, AV_LOG_ERROR, "problem during vmaf_read_pictures.\n");
         return AVERROR(EINVAL);
+    }
+
+    err = vmaf_propagate_metadata(s->vmaf, (void**)&metadata, s->frame_cnt++, set_meta);
+    if (err && err != -EBUSY && err != -12) {
+        av_log(s, AV_LOG_ERROR, "problem during vmaf_propagate_metadata. %d\n", err);
+        return AVERROR(EINVAL);
+    }
+
+    entry = NULL;
+    while ((entry = av_dict_get(metadata, "", entry, AV_DICT_IGNORE_SUFFIX))) {
+        if (entry->key && entry->value)
+            av_log(ctx, AV_LOG_INFO, "key: %s, value: %s, frame: %d\n", entry->key, entry->value, s->frame_cnt - 1);
     }
 
     return ff_filter_frame(ctx->outputs[0], dist);
@@ -488,7 +509,9 @@ static int config_input_ref(AVFilterLink *inlink)
 
     desc = av_pix_fmt_desc_get(inlink->format);
     s->bpc = desc->comp[0].depth;
-
+    // GSOC 2024
+    //s->last_index = 0;
+    // GSOC 2024 END
     return 0;
 }
 
@@ -581,6 +604,18 @@ static av_cold void uninit(AVFilterContext *ctx)
         if (s->log_path && !err)
             vmaf_write_output(s->vmaf, s->log_path, log_fmt_map(s->log_fmt));
     }
+    // GSOC 2024:
+    /*
+    if (!s->is_propagation_finished) {
+        err = vmaf_propagate_metadata(s->vmaf, NULL, &s->last_index);
+        if (err) {
+            av_log(ctx, AV_LOG_ERROR,
+                   "problem propagating metadata.\n");
+        }
+        s->is_propagation_finished = 1;
+    }
+    */
+    // GSOC 2024 END
 
 clean_up:
     if (s->model) {
