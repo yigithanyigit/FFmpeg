@@ -20,18 +20,23 @@
 
 #include "libavutil/channel_layout.h"
 #include "libavutil/avassert.h"
+#include "libavutil/mem.h"
 #include "audio.h"
 #include "avfilter.h"
 #include "internal.h"
 
+#define MAX_DB_FLT 1024
+#define MAX_DB 91
+#define HISTOGRAM_SIZE 0x10000
+#define HISTOGRAM_SIZE_FLT (MAX_DB_FLT*2)
+
 typedef struct VolDetectContext {
-    /**
-     * Number of samples at each PCM value.
-     * histogram[0x8000 + i] is the number of samples at value i.
-     * The extra element is there for symmetry.
-     */
-    uint64_t histogram[0x10001];
-} VolDetectContext;
+     uint64_t* histogram; ///< for integer number of samples at each PCM value, for float number of samples at each dB
+     uint64_t nb_samples; ///< number of samples
+     double sum2;         ///< sum of the squares of the samples
+     double max;          ///< maximum sample value
+     int is_float;        ///< true if the input is in floating point
+ } VolDetectContext;
 
 static int filter_frame(AVFilterLink *inlink, AVFrame *samples)
 {
@@ -55,8 +60,6 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *samples)
 
     return ff_filter_frame(inlink->dst->outputs[0], samples);
 }
-
-#define MAX_DB 91
 
 static inline double logdb(uint64_t v)
 {
