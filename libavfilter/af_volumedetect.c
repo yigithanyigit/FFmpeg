@@ -61,13 +61,35 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *samples)
     return ff_filter_frame(inlink->dst->outputs[0], samples);
 }
 
-static inline double logdb(uint64_t v)
-{
-    double d = v / (double)(0x8000 * 0x8000);
-    if (!v)
-        return MAX_DB;
-    return -log10(d) * 10;
-}
+static inline double logdb(double v, enum AVSampleFormat sample_fmt)
+ {
+     if (sample_fmt == AV_SAMPLE_FMT_FLT) {
+         if (!v)
+             return MAX_DB_FLT;
+         return -log10(v) * 10;
+     } else {
+         double d = v / (double)(0x8000 * 0x8000);
+         if (!v)
+             return MAX_DB;
+         return -log10(d) * 10;
+     }
+ }
+
+
+ static void update_float_stats(VolDetectContext *vd, float *audio_data)
+ {
+     double sample;
+     int idx;
+     if(!isnormal(*audio_data))
+         return;
+     sample = fabsf(*audio_data);
+     if (sample > vd->max)
+         vd->max = sample;
+     vd->sum2 += sample * sample;
+     idx = lrintf(floorf(logdb(sample * sample, AV_SAMPLE_FMT_FLT))) + MAX_DB_FLT;
+     vd->histogram[idx]++;
+     vd->nb_samples++;
+ }
 
 static void print_stats(AVFilterContext *ctx)
 {
