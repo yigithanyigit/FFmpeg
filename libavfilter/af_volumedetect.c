@@ -24,23 +24,46 @@
 #include "avfilter.h"
 #include "internal.h"
 
+#define MAX_DB_FLT 1024
 #define MAX_DB 91
+#define HISTOGRAM_SIZE 0x10000
+#define HISTOGRAM_SIZE_FLT (MAX_DB_FLT*2)
 
 typedef struct VolDetectContext {
-    /**
-     * Number of samples at each PCM value.
-     * histogram[0x8000 + i] is the number of samples at value i.
-     * The extra element is there for symmetry.
-     */
-    uint64_t histogram[0x10001];
+    uint64_t* histogram; ///< for integer number of samples at each PCM value, for float number of samples at each dB
+    uint64_t nb_samples; ///< number of samples
+    double sum2;         ///< sum of the squares of the samples
+    double max;          ///< maximum sample value
+    int is_float;        ///< true if the input is in floating point
 } VolDetectContext;
 
-static inline double logdb(uint64_t v)
+static inline double logdb(double v, enum AVSampleFormat sample_fmt)
 {
-    double d = v / (double)(0x8000 * 0x8000);
-    if (!v)
-        return MAX_DB;
-    return -log10(d) * 10;
+    if (sample_fmt == AV_SAMPLE_FMT_FLT) {
+        if (!v)
+            return MAX_DB_FLT;
+        return -log10(v) * 10;
+    } else {
+        double d = v / (double)(0x8000 * 0x8000);
+        if (!v)
+            return MAX_DB;
+        return -log10(d) * 10;
+    }
+}
+
+static void update_float_stats(VolDetectContext *vd, float *audio_data)
+{
+    double sample;
+    int idx;
+    if(!isnormal(*audio_data))
+        return;
+    sample = fabsf(*audio_data);
+    if (sample > vd->max)
+        vd->max = sample;
+    vd->sum2 += sample * sample;
+    idx = lrintf(floorf(logdb(sample * sample, AV_SAMPLE_FMT_FLT))) + MAX_DB_FLT;
+    vd->histogram[idx]++;
+    vd->nb_samples++;
 }
 
 static int filter_frame(AVFilterLink *inlink, AVFrame *samples)
