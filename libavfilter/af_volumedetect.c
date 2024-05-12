@@ -132,6 +132,34 @@ static void print_stats(AVFilterContext *ctx)
     }
 }
 
+static void print_stats_flt(AVFilterContext *ctx)
+{
+    VolDetectContext *vd = ctx->priv;
+    int i, sum = 0;
+    av_log(ctx, AV_LOG_INFO, "n_samples: %" PRId64 "\n", vd->nb_samples);
+    av_log(ctx, AV_LOG_INFO, "mean_volume: %.1f dB\n", -logdb(vd->sum2 / vd->nb_samples, AV_SAMPLE_FMT_FLT));
+    av_log(ctx, AV_LOG_INFO, "max_volume: %.1f dB\n", -2.0*logdb(vd->max, AV_SAMPLE_FMT_FLT));
+    for (i = 0; i < HISTOGRAM_SIZE_FLT && !vd->histogram[i]; i++);
+    for (; i >= 0 && sum < vd->nb_samples / 1000; i++) {
+        if (!vd->histogram[i])
+            continue;
+        av_log(ctx, AV_LOG_INFO, "histogram_%ddb: %" PRId64 "\n", MAX_DB_FLT - i, vd->histogram[i]);
+        sum += vd->histogram[i];
+    }
+}
+
+static void print_stats2(AVFilterContext *ctx)
+{
+    VolDetectContext *vd = ctx->priv;
+    if (!vd->nb_samples)
+        return;
+    if (vd->is_float) {
+        print_stats_flt(ctx);
+    } else {
+        print_stats(ctx);
+    }
+}
+
 static av_cold void uninit(AVFilterContext *ctx)
 {
     print_stats(ctx);
