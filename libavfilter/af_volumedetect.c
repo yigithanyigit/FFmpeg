@@ -24,6 +24,8 @@
 #include "avfilter.h"
 #include "internal.h"
 
+#define MAX_DB 91
+
 typedef struct VolDetectContext {
     /**
      * Number of samples at each PCM value.
@@ -32,6 +34,14 @@ typedef struct VolDetectContext {
      */
     uint64_t histogram[0x10001];
 } VolDetectContext;
+
+static inline double logdb(uint64_t v)
+{
+    double d = v / (double)(0x8000 * 0x8000);
+    if (!v)
+        return MAX_DB;
+    return -log10(d) * 10;
+}
 
 static int filter_frame(AVFilterLink *inlink, AVFrame *samples)
 {
@@ -54,16 +64,6 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *samples)
     }
 
     return ff_filter_frame(inlink->dst->outputs[0], samples);
-}
-
-#define MAX_DB 91
-
-static inline double logdb(uint64_t v)
-{
-    double d = v / (double)(0x8000 * 0x8000);
-    if (!v)
-        return MAX_DB;
-    return -log10(d) * 10;
 }
 
 static void print_stats(AVFilterContext *ctx)
