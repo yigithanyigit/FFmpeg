@@ -43,6 +43,64 @@ static inline double logdb(uint64_t v)
     return -log10(d) * 10;
 }
 
+static void process_float_planar_samples(VolDetectContext *vd, AVFrame *samples)
+{
+    int plane, i;
+    int nb_channels = samples->ch_layout.nb_channels;
+    int nb_samples  = samples->nb_samples;
+    float *audio_data;
+    for (plane = 0; plane < nb_channels; plane++) {
+        audio_data = (float *)samples->extended_data[plane];
+        for (i = 0; i < nb_samples; i++) {
+            update_float_stats(vd, &audio_data[i]);
+        }
+    }
+}
+
+static void process_float_packed_samples(VolDetectContext *vd, AVFrame *samples)
+{
+    int i, j;
+    int nb_channels = samples->ch_layout.nb_channels;
+    int nb_samples  = samples->nb_samples;
+    float *audio_data;
+    for (i = 0; i < nb_samples; i++) {
+        audio_data = (float *)samples->extended_data[0];
+        for (j = 0; j < nb_channels; j++) {
+           update_float_stats(vd, &audio_data[i * nb_channels + j]);
+        }
+    }
+}
+
+static void process_int_planar_samples(VolDetectContext *vd, AVFrame *samples)
+{
+    int plane, i;
+    int nb_channels = samples->ch_layout.nb_channels;
+    int nb_samples  = samples->nb_samples;
+    int16_t *pcm;
+    for (plane = 0; plane < nb_channels; plane++) {
+        pcm = (int16_t *)samples->extended_data[plane];
+        for (i = 0; i < nb_samples; i++) {
+            vd->histogram[pcm[i] + 0x8000]++;
+            vd->nb_samples++;
+        }
+    }
+}
+
+static void process_int_packed_samples(VolDetectContext *vd, AVFrame *samples)
+{
+    int i, j;
+    int nb_channels = samples->ch_layout.nb_channels;
+    int nb_samples  = samples->nb_samples;
+    int16_t *pcm;
+    for (i = 0; i < nb_samples; i++) {
+        pcm = (int16_t *)samples->extended_data[0];
+        for (j = 0; j < nb_channels; j++) {
+            vd->histogram[pcm[i * nb_channels + j] + 0x8000]++;
+            vd->nb_samples++;
+        }
+    }
+}
+
 static int filter_frame(AVFilterLink *inlink, AVFrame *samples)
 {
     AVFilterContext *ctx = inlink->dst;
