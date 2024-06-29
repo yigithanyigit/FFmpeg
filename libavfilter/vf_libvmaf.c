@@ -56,6 +56,7 @@ typedef struct LIBVMAFContext {
     int n_subsample;
     char *model_cfg;
     char *feature_cfg;
+    AVDictionary *metadata;
     VmafContext *vmaf;
     VmafModel **model;
     unsigned model_cnt;
@@ -102,6 +103,28 @@ static enum VmafPixelFormat pix_fmt_map(enum AVPixelFormat av_pix_fmt)
         return VMAF_PIX_FMT_YUV444P;
     default:
         return VMAF_PIX_FMT_UNKNOWN;
+    }
+}
+
+typedef struct MetaStruct {
+    AVDictionary **metadata;
+    char comp;
+} MetaStruct;
+
+//static void set_meta(AVDictionary **metadata, const char *key, char comp, float d)
+static void set_meta(void *data, const char *key, double d)
+{
+    if (!data) return;
+    MetaStruct *meta = data;
+    av_log(NULL, AV_LOG_ERROR, "key: %s, value: %f\n", key, d);
+    char value[128];
+    snprintf(value, sizeof(value), "%f", d);
+    if (meta->comp) {
+        char key2[128];
+        snprintf(key2, sizeof(key2), "%s%c", key, meta->comp);
+        av_dict_set(meta->metadata, key2, value, 0);
+    } else {
+        av_dict_set(meta->metadata, key, value, 0);
     }
 }
 
@@ -431,10 +454,18 @@ static av_cold int init(AVFilterContext *ctx)
     LIBVMAFContext *s = ctx->priv;
     int err = 0;
 
+    MetaStruct meta_data = {
+        .metadata = &s->metadata,
+        .comp     = 0,
+    };
+
     VmafConfiguration cfg = {
         .log_level = log_level_map(av_log_get_level()),
         .n_subsample = s->n_subsample,
         .n_threads = s->n_threads,
+        .callback = set_meta,
+        .meta_data = &meta_data,
+        .meta_data_sz = sizeof(meta_data),
     };
 
     err = vmaf_init(&s->vmaf, cfg);
