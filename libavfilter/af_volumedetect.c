@@ -49,7 +49,7 @@ static inline double logdb(double v, enum AVSampleFormat sample_fmt)
             return MAX_DB_FLT;
         return -log10(v) * 10;
     } else {
-        double d = v / (double)(0x8000 * 0x8000);
+        double d = ldexp(v, -30);
         if (!v)
             return MAX_DB;
         return -log10(d) * 10;
