@@ -475,7 +475,6 @@ static av_cold int init(AVFilterContext *ctx)
     VmafMetadataConfig meta_cfg = {
         .callback = set_meta,
         .data = s->meta_data,
-        .data_sz = sizeof(*s->meta_data),
     };
 
     err = vmaf_register_metadata_callback(s->vmaf, &meta_cfg);
