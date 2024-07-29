@@ -48,7 +48,6 @@
 
 typedef struct MetaStruct {
     AVDictionary **metadata;
-    char comp;
 } MetaStruct;
 
 typedef struct LIBVMAFContext {
@@ -112,21 +111,27 @@ static enum VmafPixelFormat pix_fmt_map(enum AVPixelFormat av_pix_fmt)
     }
 }
 
-//static void set_meta(AVDictionary **metadata, const char *key, char comp, float d)
-static void set_meta(void *data, const char *key, double d)
+static void dump_metadata(void *data, AVDictionary *metadata)
 {
-    if (!data) return;
-    MetaStruct *meta = data;
-    av_log(NULL, AV_LOG_ERROR, "key: %s, value: %f\n", key, d);
-    char value[128];
-    snprintf(value, sizeof(value), "%f", d);
-    if (meta->comp) {
-        char key2[128];
-        snprintf(key2, sizeof(key2), "%s%c", key, meta->comp);
-        av_dict_set(meta->metadata, key2, value, 0);
-    } else {
-        av_dict_set(meta->metadata, key, value, 0);
+    AVDictionaryEntry *tag = NULL;
+    MetaStruct *meta_data = data;
+
+    while ((tag = av_dict_get(metadata, "", tag, AV_DICT_IGNORE_SUFFIX))) {
+        av_log(NULL, AV_LOG_DEBUG, "VMAF feature: %s, score: %s\n",
+               tag->key, tag->value);
+        av_dict_set(meta_data->metadata, tag->key, tag->value, 0);
     }
+}
+
+static void set_meta(void *data, VmafMetadata *metadata)
+{
+    MetaStruct *meta_data = data;
+    char value[128], key[128];
+    snprintf(value, sizeof(value), "%0.2f", metadata->score);
+    snprintf(key, sizeof(key), "%s_%d", metadata->feature_name, metadata->picture_index);
+    av_dict_set(meta_data->metadata, key, value, 0);
+    av_log(NULL, AV_LOG_DEBUG, "VMAF feature: %s, score: %f\n",
+           key, metadata->score);
 }
 
 static int copy_picture_data(AVFrame *src, VmafPicture *dst, unsigned bpc)
@@ -470,14 +475,25 @@ static av_cold int init(AVFilterContext *ctx)
         return AVERROR(ENOMEM);
 
     s->meta_data->metadata = &s->metadata;
-    s->meta_data->comp     = 0;
 
-    VmafMetadataConfig meta_cfg = {
-        .callback = set_meta,
+    VmafMetadataConfiguration meta_cfg = {
+        .feature_name = "vmaf",
+        .callback = &set_meta,
         .data = s->meta_data,
     };
 
-    err = vmaf_register_metadata_callback(s->vmaf, &meta_cfg);
+    err = vmaf_register_metadata_callback(s->vmaf, meta_cfg);
+    if (err) {
+        return AVERROR(EINVAL);
+    }
+
+    VmafMetadataConfiguration meta_cfg_1 = {
+        .feature_name = "psnr_y",
+        .callback = &set_meta,
+        .data = s->meta_data,
+    };
+
+    err = vmaf_register_metadata_callback(s->vmaf, meta_cfg_1);
     if (err) {
         return AVERROR(EINVAL);
     }
@@ -604,6 +620,12 @@ static av_cold void uninit(AVFilterContext *ctx)
     if (err) {
         av_log(ctx, AV_LOG_ERROR,
                "problem flushing libvmaf context.\n");
+    }
+
+    if (s->meta_data) {
+        av_log(ctx, AV_LOG_INFO, "DUMPING FEATURES\n");
+        av_log(ctx, AV_LOG_INFO, "===============================\n\n");
+        dump_metadata(s->meta_data, s->metadata);
     }
 
     for (unsigned i = 0; i < s->model_cnt; i++) {
