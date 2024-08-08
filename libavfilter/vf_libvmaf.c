@@ -117,7 +117,7 @@ static void dump_metadata(void *data, AVDictionary *metadata)
     MetaStruct *meta_data = data;
 
     while ((tag = av_dict_get(metadata, "", tag, AV_DICT_IGNORE_SUFFIX))) {
-        av_log(NULL, AV_LOG_DEBUG, "VMAF feature: %s, score: %s\n",
+        av_log(NULL, AV_LOG_INFO, "VMAF feature: %s, score: %s\n",
                tag->key, tag->value);
         av_dict_set(meta_data->metadata, tag->key, tag->value, 0);
     }
@@ -130,7 +130,7 @@ static void set_meta(void *data, VmafMetadata *metadata)
     snprintf(value, sizeof(value), "%0.2f", metadata->score);
     snprintf(key, sizeof(key), "%s_%d", metadata->feature_name, metadata->picture_index);
     av_dict_set(meta_data->metadata, key, value, 0);
-    av_log(NULL, AV_LOG_DEBUG, "VMAF feature: %s, score: %f\n",
+    av_log(NULL, AV_LOG_INFO, "VMAF feature: %s, score: %f\n",
            key, metadata->score);
 }
 
@@ -482,7 +482,7 @@ static av_cold int init(AVFilterContext *ctx)
         .data = s->meta_data,
     };
 
-    err = vmaf_register_metadata_callback(s->vmaf, meta_cfg);
+    err = vmaf_register_metadata_handler(s->vmaf, meta_cfg);
     if (err) {
         return AVERROR(EINVAL);
     }
@@ -493,7 +493,7 @@ static av_cold int init(AVFilterContext *ctx)
         .data = s->meta_data,
     };
 
-    err = vmaf_register_metadata_callback(s->vmaf, meta_cfg_1);
+    err = vmaf_register_metadata_handler(s->vmaf, meta_cfg_1);
     if (err) {
         return AVERROR(EINVAL);
     }
