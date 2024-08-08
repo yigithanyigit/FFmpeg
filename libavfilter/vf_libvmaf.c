@@ -60,8 +60,12 @@ typedef struct LIBVMAFContext {
     int n_subsample;
     char *model_cfg;
     char *feature_cfg;
-    AVDictionary *metadata;
-    MetaStruct *meta_data;
+    char *metadata_feature_cfg;
+    MetaStruct *metadata_priv;
+    struct {
+        VmafMetadataConfiguration *metadata_cfgs;
+        unsigned metadata_cfg_cnt;
+    } metadata_cfg_list;
     VmafContext *vmaf;
     VmafModel **model;
     unsigned model_cnt;
@@ -83,6 +87,7 @@ static const AVOption libvmaf_options[] = {
     {"n_subsample", "Set interval for frame subsampling used when computing vmaf.",     OFFSET(n_subsample), AV_OPT_TYPE_INT, {.i64=1}, 1, UINT_MAX, FLAGS},
     {"model",  "Set the model to be used for computing vmaf.",                          OFFSET(model_cfg), AV_OPT_TYPE_STRING, {.str="version=vmaf_v0.6.1"}, 0, 1, FLAGS},
     {"feature",  "Set the feature to be used for computing vmaf.",                      OFFSET(feature_cfg), AV_OPT_TYPE_STRING, {.str=NULL}, 0, 1, FLAGS},
+    {"metadata_handler",  "Set the feature to be propagated as metadata.",              OFFSET(metadata_feature_cfg), AV_OPT_TYPE_STRING, {.str="name=vmaf"}, 0, 1, FLAGS},
     { NULL }
 };
 
@@ -114,22 +119,22 @@ static enum VmafPixelFormat pix_fmt_map(enum AVPixelFormat av_pix_fmt)
 static void dump_metadata(void *data, AVDictionary *metadata)
 {
     AVDictionaryEntry *tag = NULL;
-    MetaStruct *meta_data = data;
+    MetaStruct *metadata_priv = data;
 
     while ((tag = av_dict_get(metadata, "", tag, AV_DICT_IGNORE_SUFFIX))) {
         av_log(NULL, AV_LOG_INFO, "VMAF feature: %s, score: %s\n",
                tag->key, tag->value);
-        av_dict_set(meta_data->metadata, tag->key, tag->value, 0);
+        av_dict_set(metadata_priv->metadata, tag->key, tag->value, 0);
     }
 }
 
 static void set_meta(void *data, VmafMetadata *metadata)
 {
-    MetaStruct *meta_data = data;
+    MetaStruct *metadata_priv = data;
     char value[128], key[128];
     snprintf(value, sizeof(value), "%0.2f", metadata->score);
     snprintf(key, sizeof(key), "%s_%d", metadata->feature_name, metadata->picture_index);
-    av_dict_set(meta_data->metadata, key, value, 0);
+    av_dict_set(metadata_priv->metadata, key, value, 0);
     av_log(NULL, AV_LOG_INFO, "VMAF feature: %s, score: %f\n",
            key, metadata->score);
 }
@@ -437,6 +442,83 @@ exit:
     return err;
 }
 
+static int parse_metadata_handlers(AVFilterContext *ctx)
+{
+    LIBVMAFContext *s = ctx->priv;
+    AVDictionary **dict;
+    unsigned dict_cnt;
+    int err = 0;
+
+    if (!s->metadata_feature_cfg)
+        return 0;
+
+    dict_cnt = 0;
+    dict = delimited_dict_parse(s->metadata_feature_cfg, &dict_cnt);
+    if (!dict) {
+        av_log(ctx, AV_LOG_ERROR,
+               "could not parse metadata feature config: %s\n",
+               s->metadata_feature_cfg);
+        return AVERROR(EINVAL);
+    }
+
+    for (unsigned i = 0; i < dict_cnt; i++) {
+        VmafMetadataConfiguration *metadata_cfg = av_calloc(1, sizeof(*metadata_cfg));
+        const AVDictionaryEntry *e = NULL;
+        char *feature_name = NULL;
+
+        while (e = av_dict_iterate(dict[i], e)) {
+            if (!strcmp(e->key, "name")) {
+                metadata_cfg->feature_name = av_strdup(e->value);
+                continue;
+            }
+        }
+
+        metadata_cfg->data = s->metadata_priv;
+        metadata_cfg->callback = &set_meta;
+
+        err = vmaf_register_metadata_handler(s->vmaf, *metadata_cfg);
+        if (err) {
+            av_log(ctx, AV_LOG_ERROR,
+                   "problem during vmaf_register_metadata_handler: %s\n",
+                   feature_name);
+            goto exit;
+        }
+
+        s->metadata_cfg_list.metadata_cfgs = av_realloc(s->metadata_cfg_list.metadata_cfgs,
+                                             (s->metadata_cfg_list.metadata_cfg_cnt + 1) *
+                                             sizeof(*s->metadata_cfg_list.metadata_cfgs));
+        if (!s->metadata_cfg_list.metadata_cfgs) {
+            err = AVERROR(ENOMEM);
+            goto exit;
+        }
+
+        s->metadata_cfg_list.metadata_cfgs[s->metadata_cfg_list.metadata_cfg_cnt++] = *metadata_cfg;
+    }
+
+exit:
+    for (unsigned i = 0; i < dict_cnt; i++) {
+        if (dict[i])
+            av_dict_free(&dict[i]);
+    }
+    av_free(dict);
+    return err;
+}
+
+static int init_metadata(AVFilterContext *ctx)
+{
+    LIBVMAFContext *s = ctx->priv;
+
+    s->metadata_priv = av_calloc(1, sizeof(*s->metadata_priv));
+    if (!s->metadata_priv)
+        return AVERROR(ENOMEM);
+
+    s->metadata_priv->metadata = av_calloc(1, sizeof(AVDictionary*));
+    if (!s->metadata_priv->metadata)
+        return AVERROR(ENOMEM);
+
+    return 0;
+}
+
 static enum VmafLogLevel log_level_map(int log_level)
 {
     switch (log_level) {
@@ -470,33 +552,13 @@ static av_cold int init(AVFilterContext *ctx)
     if (err)
         return AVERROR(EINVAL);
 
-    s->meta_data = malloc(sizeof(*s->meta_data));
+    err = init_metadata(ctx);
     if (err)
-        return AVERROR(ENOMEM);
+        return err;
 
-    s->meta_data->metadata = &s->metadata;
-
-    VmafMetadataConfiguration meta_cfg = {
-        .feature_name = "vmaf",
-        .callback = &set_meta,
-        .data = s->meta_data,
-    };
-
-    err = vmaf_register_metadata_handler(s->vmaf, meta_cfg);
-    if (err) {
-        return AVERROR(EINVAL);
-    }
-
-    VmafMetadataConfiguration meta_cfg_1 = {
-        .feature_name = "psnr_y",
-        .callback = &set_meta,
-        .data = s->meta_data,
-    };
-
-    err = vmaf_register_metadata_handler(s->vmaf, meta_cfg_1);
-    if (err) {
-        return AVERROR(EINVAL);
-    }
+    err = parse_metadata_handlers(ctx);
+    if (err)
+        return err;
 
     err = parse_models(ctx);
     if (err)
@@ -622,10 +684,21 @@ static av_cold void uninit(AVFilterContext *ctx)
                "problem flushing libvmaf context.\n");
     }
 
-    if (s->meta_data) {
+    if (s->metadata_priv) {
         av_log(ctx, AV_LOG_INFO, "DUMPING FEATURES\n");
         av_log(ctx, AV_LOG_INFO, "===============================\n\n");
-        dump_metadata(s->meta_data, s->metadata);
+        dump_metadata(s->metadata_priv, *s->metadata_priv->metadata);
+        av_log(ctx, AV_LOG_INFO, "===============================\n\n");
+
+        av_dict_free(s->metadata_priv->metadata);
+        av_free(s->metadata_priv);
+    }
+
+    if (s->metadata_cfg_list.metadata_cfgs) {
+        for (unsigned i = 0; i < s->metadata_cfg_list.metadata_cfg_cnt; i++) {
+            av_free(s->metadata_cfg_list.metadata_cfgs[i].feature_name);
+        }
+        av_free(s->metadata_cfg_list.metadata_cfgs);
     }
 
     for (unsigned i = 0; i < s->model_cnt; i++) {
