@@ -29,6 +29,7 @@
 #include <libvmaf.h>
 
 #include "libavutil/avstring.h"
+#include "libavutil/dict.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
@@ -46,10 +47,6 @@
 #include "libavutil/hwcontext_cuda_internal.h"
 #endif
 
-typedef struct MetaStruct {
-    AVDictionary **metadata;
-} MetaStruct;
-
 typedef struct LIBVMAFContext {
     const AVClass *class;
     FFFrameSync fs;
@@ -61,7 +58,7 @@ typedef struct LIBVMAFContext {
     char *model_cfg;
     char *feature_cfg;
     char *metadata_feature_cfg;
-    MetaStruct *metadata_priv;
+    AVDictionary **metadata_priv;
     struct {
         VmafMetadataConfiguration *metadata_cfgs;
         unsigned metadata_cfg_cnt;
@@ -119,22 +116,25 @@ static enum VmafPixelFormat pix_fmt_map(enum AVPixelFormat av_pix_fmt)
 static void dump_metadata(void *data, AVDictionary *metadata)
 {
     AVDictionaryEntry *tag = NULL;
-    MetaStruct *metadata_priv = data;
+    AVDictionary **metadata_priv = data;
 
     while ((tag = av_dict_get(metadata, "", tag, AV_DICT_IGNORE_SUFFIX))) {
         av_log(NULL, AV_LOG_INFO, "VMAF feature: %s, score: %s\n",
                tag->key, tag->value);
-        av_dict_set(metadata_priv->metadata, tag->key, tag->value, 0);
+        av_dict_set(metadata_priv, tag->key, tag->value, 0);
     }
 }
 
 static void set_meta(void *data, VmafMetadata *metadata)
 {
-    MetaStruct *metadata_priv = data;
+    int err = 0;
+    AVDictionary **metadata_priv = data;
     char value[128], key[128];
     snprintf(value, sizeof(value), "%0.2f", metadata->score);
     snprintf(key, sizeof(key), "%s_%d", metadata->feature_name, metadata->picture_index);
-    av_dict_set(metadata_priv->metadata, key, value, 0);
+    err = av_dict_set(metadata_priv, key, value, 0);
+    if (err < 0)
+        av_log(NULL, AV_LOG_ERROR, "could not set metadata: %s\n", key);
     av_log(NULL, AV_LOG_INFO, "VMAF feature: %s, score: %f\n",
            key, metadata->score);
 }
@@ -508,14 +508,9 @@ static int init_metadata(AVFilterContext *ctx)
 {
     LIBVMAFContext *s = ctx->priv;
 
-    s->metadata_priv = av_calloc(1, sizeof(*s->metadata_priv));
+    s->metadata_priv = av_calloc(1, sizeof(AVDictionary*));
     if (!s->metadata_priv)
         return AVERROR(ENOMEM);
-
-    s->metadata_priv->metadata = av_calloc(1, sizeof(AVDictionary*));
-    if (!s->metadata_priv->metadata)
-        return AVERROR(ENOMEM);
-
     return 0;
 }
 
@@ -687,10 +682,10 @@ static av_cold void uninit(AVFilterContext *ctx)
     if (s->metadata_priv) {
         av_log(ctx, AV_LOG_INFO, "DUMPING FEATURES\n");
         av_log(ctx, AV_LOG_INFO, "===============================\n\n");
-        dump_metadata(s->metadata_priv, *s->metadata_priv->metadata);
+        dump_metadata(s->metadata_priv, *s->metadata_priv);
         av_log(ctx, AV_LOG_INFO, "===============================\n\n");
 
-        av_dict_free(s->metadata_priv->metadata);
+        av_dict_free(s->metadata_priv);
         av_free(s->metadata_priv);
     }
 
