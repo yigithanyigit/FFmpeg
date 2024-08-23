@@ -90,7 +90,6 @@ typedef struct LIBVMAFContext {
 #endif
 } LIBVMAFContext;
 
-#define MAX_PENDING_FRAMES 24
 #define OFFSET(x) offsetof(LIBVMAFContext, x)
 #define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM
 
