@@ -48,12 +48,19 @@
 #include "libavutil/hwcontext_cuda_internal.h"
 #endif
 
+#if CONFIG_LIBVMAF_METADATA_FILTER
 typedef struct FrameList {
     AVFrame *frame;
     unsigned frame_number;
     unsigned propagated_handlers_cnt;
     struct FrameList *next;
 } FrameList;
+
+typedef struct CallbackStruct {
+    struct LIBVMAFContext *s;
+    FrameList *frame_list;
+} CallbackStruct;
+#endif
 
 typedef struct LIBVMAFContext {
     const AVClass *class;
@@ -64,13 +71,15 @@ typedef struct LIBVMAFContext {
     int n_threads;
     int n_subsample;
     char *model_cfg;
+#if CONFIG_LIBVMAF_METADATA_FILTER
     char *feature_cfg;
     char *metadata_feature_cfg;
     struct {
         VmafMetadataConfiguration *metadata_cfgs;
         unsigned metadata_cfg_cnt;
     } metadata_cfg_list;
-    struct CallbackStruct *cb;
+    CallbackStruct *cb;
+#endif
     VmafContext *vmaf;
     VmafModel **model;
     unsigned model_cnt;
@@ -80,11 +89,6 @@ typedef struct LIBVMAFContext {
     VmafCudaState *cu_state;
 #endif
 } LIBVMAFContext;
-
-typedef struct CallbackStruct {
-    struct LIBVMAFContext *s;
-    FrameList *frame_list;
-} CallbackStruct;
 
 #define OFFSET(x) offsetof(LIBVMAFContext, x)
 #define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM
@@ -126,6 +130,7 @@ static enum VmafPixelFormat pix_fmt_map(enum AVPixelFormat av_pix_fmt)
     }
 }
 
+#if CONFIG_LIBVMAF_METADATA_FILTER
 static int add_to_frame_list(FrameList **head, AVFrame *frame, unsigned frame_number)
 {
     FrameList *new_frame = av_malloc(sizeof(FrameList));
@@ -237,6 +242,7 @@ static void set_meta(void *data, VmafMetadata *metadata)
     }
     av_log(NULL, AV_LOG_INFO, "VMAF feature: %s, score: %f\n", key, metadata->score);
 }
+#endif
 
 static int copy_picture_data(AVFrame *src, VmafPicture *dst, unsigned bpc)
 {
@@ -293,11 +299,13 @@ static int do_vmaf(FFFrameSync *fs)
         return AVERROR(ENOMEM);
     }
 
+#if CONFIG_LIBVMAF_METADATA_FILTER
     err = add_to_frame_list(&s->cb->frame_list, dist, s->frame_cnt);
     if (err) {
         av_log(s, AV_LOG_ERROR, "problem during add_to_frame_list.\n");
         return AVERROR(ENOMEM);
     }
+#endif
 
     err = vmaf_read_pictures(s->vmaf, &pic_ref, &pic_dist, s->frame_cnt++);
     if (err) {
@@ -305,8 +313,11 @@ static int do_vmaf(FFFrameSync *fs)
         return AVERROR(EINVAL);
     }
 
-    // It EXCEEDS the frame count, if dont use ff_filter_frame
+#if CONFIG_LIBVMAF_METADATA_FILTER
     return 0;
+#else
+    return ff_filter_frame(ctx->outputs[0], dist);
+#endif
 }
 
 static AVDictionary **delimited_dict_parse(char *str, unsigned *cnt)
@@ -548,6 +559,7 @@ exit:
     return err;
 }
 
+#if CONFIG_LIBVMAF_METADATA_FILTER
 static int parse_metadata_handlers(AVFilterContext *ctx)
 {
     LIBVMAFContext *s = ctx->priv;
@@ -622,6 +634,7 @@ static int init_metadata(AVFilterContext *ctx)
 
     return 0;
 }
+#endif
 
 static enum VmafLogLevel log_level_map(int log_level)
 {
@@ -656,6 +669,7 @@ static av_cold int init(AVFilterContext *ctx)
     if (err)
         return AVERROR(EINVAL);
 
+#if CONFIG_LIBVMAF_METADATA_FILTER
     err = init_metadata(ctx);
     if (err)
         return err;
@@ -663,6 +677,7 @@ static av_cold int init(AVFilterContext *ctx)
     err = parse_metadata_handlers(ctx);
     if (err)
         return err;
+#endif
 
     err = parse_models(ctx);
     if (err)
@@ -788,12 +803,20 @@ static av_cold void uninit(AVFilterContext *ctx)
                "problem flushing libvmaf context.\n");
     }
 
+#if CONFIG_LIBVMAF_METADATA_FILTER
     if (s->metadata_cfg_list.metadata_cfgs) {
         for (unsigned i = 0; i < s->metadata_cfg_list.metadata_cfg_cnt; i++) {
             av_free(s->metadata_cfg_list.metadata_cfgs[i].feature_name);
         }
         av_free(s->metadata_cfg_list.metadata_cfgs);
     }
+
+    err = free_frame_list(&s->cb->frame_list);
+    if (err) {
+        av_log(ctx, AV_LOG_ERROR,
+               "problem freeing frame list.\n");
+    }
+#endif
 
     for (unsigned i = 0; i < s->model_cnt; i++) {
         double vmaf_score;
@@ -810,12 +833,6 @@ static av_cold void uninit(AVFilterContext *ctx)
     if (s->vmaf) {
         if (s->log_path && !err)
             vmaf_write_output(s->vmaf, s->log_path, log_fmt_map(s->log_fmt));
-    }
-
-    err = free_frame_list(&s->cb->frame_list);
-    if (err) {
-        av_log(ctx, AV_LOG_ERROR,
-               "problem freeing frame list.\n");
     }
 
 clean_up:
@@ -1056,5 +1073,21 @@ const AVFilter ff_vf_libvmaf_cuda = {
     FILTER_OUTPUTS(libvmaf_outputs_cuda),
     FILTER_SINGLE_PIXFMT(AV_PIX_FMT_CUDA),
     .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
+};
+#endif
+
+#if CONFIG_LIBVMAF_METADATA_FILTER
+const AVFilter ff_vf_libvmaf_metadata = {
+    .name           = "libvmaf_cuda",
+    .description    = NULL_IF_CONFIG_SMALL("Calculate the VMAF between two video streams."),
+    .preinit        = libvmaf_framesync_preinit,
+    .init           = init,
+    .uninit         = uninit,
+    .activate       = activate,
+    .priv_size      = sizeof(LIBVMAFContext),
+    .priv_class     = &libvmaf_class,
+    FILTER_INPUTS(libvmaf_inputs),
+    FILTER_OUTPUTS(libvmaf_outputs),
+    FILTER_PIXFMTS_ARRAY(pix_fmts),
 };
 #endif
