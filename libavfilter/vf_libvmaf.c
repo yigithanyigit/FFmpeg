@@ -27,6 +27,7 @@
 #include "config_components.h"
 
 #include <libvmaf.h>
+#include <libvmaf/version.h>
 
 #include "libavutil/avstring.h"
 #include "libavutil/dict.h"
@@ -46,6 +47,15 @@
 
 #include "libavutil/hwcontext.h"
 #include "libavutil/hwcontext_cuda_internal.h"
+#endif
+
+#define VMAF_VERSION_INT_VER(major, minor, patch) \
+    ((major) * 10000 + (minor) * 100 + (patch))
+
+#if VMAF_VERSION_INT_VER(VMAF_API_VERSION_MAJOR, VMAF_API_VERSION_MINOR, VMAF_API_VERSION_PATCH) > VMAF_VERSION_INT_VER(2, 0, 0)
+#define CONFIG_LIBVMAF_METADATA_FILTER 1
+#else 
+#define CONFIG_LIBVMAF_METADATA_FILTER 0
 #endif
 
 #if CONFIG_LIBVMAF_METADATA_FILTER
@@ -277,9 +287,8 @@ static int do_vmaf(FFFrameSync *fs)
     VmafPicture pic_ref, pic_dist;
     AVFrame *ref, *dist;
     int err = 0;
-    int ret = 0;
 
-    ret = ff_framesync_dualinput_get(fs, &dist, &ref);
+    int ret = ff_framesync_dualinput_get(fs, &dist, &ref);
     if (ret < 0)
         return ret;
     if (ctx->is_disabled || !ref)
@@ -1084,17 +1093,3 @@ const AVFilter ff_vf_libvmaf_cuda = {
     .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
 };
 #endif
-
-const AVFilter ff_vf_libvmaf_metadata = {
-    .name           = "libvmaf_metadata",
-    .description    = NULL_IF_CONFIG_SMALL("Calculate the VMAF between two video streams."),
-    .preinit        = libvmaf_framesync_preinit,
-    .init           = init,
-    .uninit         = uninit,
-    .activate       = activate,
-    .priv_size      = sizeof(LIBVMAFContext),
-    .priv_class     = &libvmaf_class,
-    FILTER_INPUTS(libvmaf_inputs),
-    FILTER_OUTPUTS(libvmaf_outputs),
-    FILTER_PIXFMTS_ARRAY(pix_fmts),
-};
