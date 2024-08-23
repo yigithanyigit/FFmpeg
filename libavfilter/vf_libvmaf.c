@@ -71,8 +71,8 @@ typedef struct LIBVMAFContext {
     int n_threads;
     int n_subsample;
     char *model_cfg;
-#if CONFIG_LIBVMAF_METADATA_FILTER
     char *feature_cfg;
+#if CONFIG_LIBVMAF_METADATA_FILTER
     char *metadata_feature_cfg;
     struct {
         VmafMetadataConfiguration *metadata_cfgs;
@@ -90,6 +90,7 @@ typedef struct LIBVMAFContext {
 #endif
 } LIBVMAFContext;
 
+#define MAX_PENDING_FRAMES 24
 #define OFFSET(x) offsetof(LIBVMAFContext, x)
 #define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM
 
@@ -101,7 +102,9 @@ static const AVOption libvmaf_options[] = {
     {"n_subsample", "Set interval for frame subsampling used when computing vmaf.",     OFFSET(n_subsample), AV_OPT_TYPE_INT, {.i64=1}, 1, UINT_MAX, FLAGS},
     {"model",  "Set the model to be used for computing vmaf.",                          OFFSET(model_cfg), AV_OPT_TYPE_STRING, {.str="version=vmaf_v0.6.1"}, 0, 1, FLAGS},
     {"feature",  "Set the feature to be used for computing vmaf.",                      OFFSET(feature_cfg), AV_OPT_TYPE_STRING, {.str=NULL}, 0, 1, FLAGS},
+#if CONFIG_LIBVMAF_METADATA_FILTER
     {"metadata_handler",  "Set the feature to be propagated as metadata.",              OFFSET(metadata_feature_cfg), AV_OPT_TYPE_STRING, {.str="name=vmaf"}, 0, 1, FLAGS},
+#endif
     { NULL }
 };
 
@@ -230,8 +233,11 @@ static void set_meta(void *data, VmafMetadata *metadata)
             if (cur->propagated_handlers_cnt == cb->s->metadata_cfg_list.metadata_cfg_cnt) {
                 FrameList *next;
                 // This necessary to avoid segfaults in filtergraphs
-                if (cb->s->fs.parent->outputs[0])
+                if (cb->s->fs.parent->outputs[0]) {
                     ff_filter_frame(cb->s->fs.parent->outputs[0], cur->frame);
+                }
+                else
+                    av_frame_free(&cur->frame);
                 next = cur->next;
                 remove_from_frame_list(&cb->frame_list, cur->frame_number);
                 cur = next;
@@ -240,7 +246,7 @@ static void set_meta(void *data, VmafMetadata *metadata)
                 break;
         }
     }
-    av_log(NULL, AV_LOG_INFO, "VMAF feature: %s, score: %f\n", key, metadata->score);
+    av_log(NULL, AV_LOG_WARNING, "VMAF feature: %s, score: %f\n", key, metadata->score);
 }
 #endif
 
@@ -272,8 +278,9 @@ static int do_vmaf(FFFrameSync *fs)
     VmafPicture pic_ref, pic_dist;
     AVFrame *ref, *dist;
     int err = 0;
+    int ret = 0;
 
-    int ret = ff_framesync_dualinput_get(fs, &dist, &ref);
+    ret = ff_framesync_dualinput_get(fs, &dist, &ref);
     if (ret < 0)
         return ret;
     if (ctx->is_disabled || !ref)
@@ -314,7 +321,10 @@ static int do_vmaf(FFFrameSync *fs)
     }
 
 #if CONFIG_LIBVMAF_METADATA_FILTER
-    return 0;
+    if (!s->metadata_cfg_list.metadata_cfg_cnt)
+        return ff_filter_frame(ctx->outputs[0], dist);
+    else
+        return 0;
 #else
     return ff_filter_frame(ctx->outputs[0], dist);
 #endif
@@ -1076,9 +1086,8 @@ const AVFilter ff_vf_libvmaf_cuda = {
 };
 #endif
 
-#if CONFIG_LIBVMAF_METADATA_FILTER
 const AVFilter ff_vf_libvmaf_metadata = {
-    .name           = "libvmaf_cuda",
+    .name           = "libvmaf_metadata",
     .description    = NULL_IF_CONFIG_SMALL("Calculate the VMAF between two video streams."),
     .preinit        = libvmaf_framesync_preinit,
     .init           = init,
@@ -1090,4 +1099,3 @@ const AVFilter ff_vf_libvmaf_metadata = {
     FILTER_OUTPUTS(libvmaf_outputs),
     FILTER_PIXFMTS_ARRAY(pix_fmts),
 };
-#endif
