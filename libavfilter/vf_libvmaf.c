@@ -799,16 +799,15 @@ static int activate(AVFilterContext *ctx)
     if (ff_outlink_get_status(ctx->outputs[0]))
         s->outlink_eof = 1;
 
-    for (unsigned i = 0; i < ctx->nb_inputs; i++) {
-        if (ff_inlink_acknowledge_status(ctx->inputs[i], &status, &pts)){
-            if (!s->flushed) {
-                ret = vmaf_read_pictures(s->vmaf, NULL, NULL, 0);
-                if (ret) 
-                    av_log(ctx, AV_LOG_ERROR,
-                           "problem flushing libvmaf context.\n");
-                else
-                    s->flushed = 1;
-            }
+    if (ff_inlink_acknowledge_status(ctx->inputs[0], &status, &pts) && 
+        ff_inlink_acknowledge_status(ctx->inputs[1], &status, &pts)) {
+        if (!s->flushed) {
+            ret = vmaf_read_pictures(s->vmaf, NULL, NULL, 0);
+            if (ret) 
+                av_log(ctx, AV_LOG_ERROR,
+                       "problem flushing libvmaf context.\n");
+            else
+                s->flushed = 1;
         }
     }
 #endif
