@@ -248,10 +248,11 @@ static void set_meta(void *data, VmafMetadata *metadata)
             if (cur->propagated_handlers_cnt == cb->s->metadata_cfg_list.metadata_cfg_cnt) {
                 FrameList *next;
                 // Check outlink is closed
-                if (cb->s->eof_frame <= cb->s->frame_cnt - 1 && !cb->s->outlink_eof) {
+                if (!cb->s->outlink_eof) {
                     av_log(cb->s->fs.parent, AV_LOG_DEBUG, "VMAF feature: %d, score: %f\n", cur->frame_number, metadata->score);
                     cb->s->eof_frame = cur->frame_number;
-                    ff_filter_frame(cb->s->fs.parent->outputs[0], cur->frame);
+                    if(ff_filter_frame(cb->s->fs.parent->outputs[0], cur->frame))
+                        return;
                 }
                 next = cur->next;
                 remove_from_frame_list(&cb->frame_list, cur->frame_number);
@@ -334,10 +335,8 @@ static int do_vmaf(FFFrameSync *fs)
     }
 
 #if CONFIG_LIBVMAF_METADATA_ENABLED
-    if (s->metadata_cfg_list.metadata_cfg_cnt) {
-        av_log(s, AV_LOG_DEBUG, "frame: %d\n", s->frame_cnt - 1);
+    if (s->metadata_cfg_list.metadata_cfg_cnt)
         return 0;
-    }
     else
         return ff_filter_frame(ctx->outputs[0], dist);
 #else
@@ -792,29 +791,24 @@ static int activate(AVFilterContext *ctx)
     //   This case relatively easy to handle. Because of calculation of vmaf score takes time
     //   So `do_vmaf` buffers many of frames before sending to outlink that causes
     //   premature close of outlink.
-    //   Checking inlink status is enough and if inlinkeof flushing vmaf is enough for this.
+    //   Checking inlink status is enough and if inlink == eof flushing vmaf is enough for this.
     int64_t pts;
     int status, ret = 0;
-    ret = ff_outlink_get_status(ctx->outputs[0]);
-    if (ret){
+
+    if (ff_outlink_get_status(ctx->outputs[0]))
         s->outlink_eof = 1;
-        ff_inlink_set_status(ctx->inputs[0], ret);
-        return 0;
-    }
-    ret = ff_inlink_acknowledge_status(ctx->inputs[0], &status, &pts);
-    if (ret){
-        // Make sure last frame is processed
-        ff_framesync_activate(&s->fs);
 
-        ret = vmaf_read_pictures(s->vmaf, NULL, NULL, 0);
-        if (ret) {
-            av_log(ctx, AV_LOG_ERROR,
-                   "problem flushing libvmaf context.\n");
+    for (unsigned i = 0; i < ctx->nb_inputs; i++) {
+        if (ff_inlink_acknowledge_status(ctx->inputs[i], &status, &pts)){
+            if (!s->flushed) {
+                ret = vmaf_read_pictures(s->vmaf, NULL, NULL, 0);
+                if (ret) 
+                    av_log(ctx, AV_LOG_ERROR,
+                           "problem flushing libvmaf context.\n");
+                else
+                    s->flushed = 1;
+            }
         }
-        s->flushed = 1;
-
-        ff_outlink_set_status(ctx->outputs[0], status, pts);
-        return 0;
     }
 #endif
     return ff_framesync_activate(&s->fs);
@@ -855,8 +849,10 @@ static av_cold void uninit(AVFilterContext *ctx)
     LIBVMAFContext *s = ctx->priv;
     int err = 0;
 
+#if CONFIG_LIBVMAF_METADATA_ENABLED
     if (!s->outlink_eof)
         s->outlink_eof = 1;
+#endif
 
     ff_framesync_uninit(&s->fs);
 
@@ -868,8 +864,8 @@ static av_cold void uninit(AVFilterContext *ctx)
         if (err) {
             av_log(ctx, AV_LOG_ERROR,
                    "problem flushing libvmaf context.\n");
-        }
-        s->flushed = 1;
+        } else
+            s->flushed = 1;
     }
 
 #if CONFIG_LIBVMAF_METADATA_ENABLED
