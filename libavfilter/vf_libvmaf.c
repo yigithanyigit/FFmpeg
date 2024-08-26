@@ -246,9 +246,7 @@ static void set_meta(void *data, VmafMetadata *metadata)
         while(cur && cur->frame_number <= metadata->picture_index) {
             if (cur->propagated_handlers_cnt == cb->s->metadata_cfg_list.metadata_cfg_cnt) {
                 FrameList *next;
-                av_log(cb->s->fs.parent, AV_LOG_DEBUG, "eof %d \n", cb->s->outlink_eof);
                 // Check outlink is closed
-                av_log(cb->s->fs.parent, AV_LOG_DEBUG, "RETTTTTTTTt %d\n", cb->s->eof_frame <= cb->s->frame_cnt - 1);
                 if (cb->s->eof_frame <= cb->s->frame_cnt - 1 && !cb->s->outlink_eof) {
                     av_log(cb->s->fs.parent, AV_LOG_DEBUG, "VMAF feature: %d, score: %f\n", cur->frame_number, metadata->score);
                     cb->s->eof_frame = cur->frame_number;
@@ -797,34 +795,24 @@ static int activate(AVFilterContext *ctx)
     int64_t pts;
     int status, ret = 0;
     ret = ff_outlink_get_status(ctx->outputs[0]);
-    av_log(ctx, AV_LOG_DEBUG, "outlink ret: %d\n", ret);
     if (ret){
-        av_log(ctx, AV_LOG_DEBUG, "FRAME NOT WANTED \n" );
         s->outlink_eof = 1;
         ff_inlink_set_status(ctx->inputs[0], ret);
         return 0;
     }
-    if (s->eof_frame <= s->frame_cnt - 1) {
-        av_log(ctx, AV_LOG_DEBUG, "EOF FRAME: %d\n", s->eof_frame);
-    }
     ret = ff_inlink_acknowledge_status(ctx->inputs[0], &status, &pts);
-    av_log(ctx, AV_LOG_DEBUG, "inlink ret: %d status %d \n", ret, status);
-    av_log(s, AV_LOG_DEBUG, "activate frame cnt: %d\n", s->frame_cnt - 1);
     if (ret){
         // Make sure last frame is processed
         ff_framesync_activate(&s->fs);
 
-        av_log(ctx, AV_LOG_DEBUG, "starting flush\n");
         ret = vmaf_read_pictures(s->vmaf, NULL, NULL, 0);
         if (ret) {
             av_log(ctx, AV_LOG_ERROR,
                    "problem flushing libvmaf context.\n");
         }
         s->flushed = 1;
-        av_log(ctx, AV_LOG_DEBUG, "vmaf flushed\n");
 
         ff_outlink_set_status(ctx->outputs[0], status, pts);
-        av_log(ctx, AV_LOG_DEBUG, "outlink status set\n");
         return 0;
     }
 #endif
@@ -866,12 +854,8 @@ static av_cold void uninit(AVFilterContext *ctx)
     LIBVMAFContext *s = ctx->priv;
     int err = 0;
 
-    av_log(ctx, AV_LOG_DEBUG, "UNINIT\n\n\n\n\n\n\n");
-
-    if (!s->outlink_eof) {
+    if (!s->outlink_eof)
         s->outlink_eof = 1;
-        av_log(ctx, AV_LOG_DEBUG, "EOF SET\n");
-    }
 
     ff_framesync_uninit(&s->fs);
 
