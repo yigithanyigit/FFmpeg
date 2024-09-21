@@ -27,7 +27,6 @@
 #include "config_components.h"
 
 #include <libvmaf.h>
-#include <libvmaf/version.h>
 
 #include "libavutil/avstring.h"
 #include "libavutil/dict.h"
@@ -50,13 +49,7 @@
 #include "libavutil/hwcontext_cuda_internal.h"
 #endif
 
-#define VMAF_VERSION_INT_VER(major, minor, patch) \
-    ((major) * 10000 + (minor) * 100 + (patch))
-
-#if VMAF_VERSION_INT_VER(VMAF_API_VERSION_MAJOR, VMAF_API_VERSION_MINOR, VMAF_API_VERSION_PATCH) > VMAF_VERSION_INT_VER(2, 0, 0)
-
-#define CONFIG_LIBVMAF_METADATA_ENABLED 1
-#else
+#ifndef CONFIG_LIBVMAF_METADATA_ENABLED
 #define CONFIG_LIBVMAF_METADATA_ENABLED 0
 #endif
 
