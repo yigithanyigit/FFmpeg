@@ -81,10 +81,7 @@ typedef struct LIBVMAFContext {
     char *feature_cfg;
 #if CONFIG_LIBVMAF_METADATA_ENABLED
     char *metadata_feature_cfg;
-    struct {
-        VmafMetadataConfiguration *metadata_cfgs;
-        unsigned metadata_cfg_cnt;
-    } metadata_cfg_list;
+    unsigned metadata_cfg_cnt;
     CallbackStruct *cb;
     atomic_uint outlink_eof;
     atomic_uint eof_frame;
@@ -222,6 +219,8 @@ static void set_meta(void *data, VmafMetadata *metadata)
     snprintf(value, sizeof(value), "%0.2f", metadata->score);
     snprintf(key, sizeof(key), "%s.%d", metadata->feature_name, metadata->picture_index);
 
+    av_log(NULL, AV_LOG_DEBUG, "metadata: %s=%s\n", metadata->feature_name, value);
+
     current_frame = get_frame_from_frame_list(cb->frame_list, metadata->picture_index);
     if (!current_frame) {
         av_log(NULL, AV_LOG_ERROR, "could not find frame with index: %d\n",
@@ -234,12 +233,13 @@ static void set_meta(void *data, VmafMetadata *metadata)
         av_log(NULL, AV_LOG_ERROR, "could not set metadata: %s\n", key);
 
     current_frame->propagated_handlers_cnt++;
+    av_log(NULL, AV_LOG_ERROR, "curr: %d, cfg_cnt: %d", current_frame->propagated_handlers_cnt, cb->s->metadata_cfg_cnt);
 
-    if (current_frame->propagated_handlers_cnt == cb->s->metadata_cfg_list.metadata_cfg_cnt) {
+    if (current_frame->propagated_handlers_cnt == cb->s->metadata_cfg_cnt) {
         FrameList *cur = cb->frame_list;
         // This code block allows to send frames monotonically
         while(cur && cur->frame_number <= metadata->picture_index) {
-            if (cur->propagated_handlers_cnt == cb->s->metadata_cfg_list.metadata_cfg_cnt) {
+            if (cur->propagated_handlers_cnt == cb->s->metadata_cfg_cnt) {
                 FrameList *next;
                 // Check outlink is closed
                 if (!cb->s->outlink_eof) {
@@ -329,7 +329,7 @@ static int do_vmaf(FFFrameSync *fs)
     }
 
 #if CONFIG_LIBVMAF_METADATA_ENABLED
-    if (s->metadata_cfg_list.metadata_cfg_cnt)
+    if (s->metadata_cfg_cnt)
         return 0;
     else
         return ff_filter_frame(ctx->outputs[0], dist);
@@ -434,6 +434,30 @@ static int parse_features(AVFilterContext *ctx)
                    "problem during vmaf_use_feature: %s\n", feature_name);
             goto exit;
         }
+
+        #if CONFIG_LIBVMAF_METADATA_ENABLED
+        VmafMetadataConfiguration metadata_cfg = {0};
+        metadata_cfg.data = s->cb;
+        metadata_cfg.callback = &set_meta;
+        metadata_cfg.feature_name = av_strdup(feature_name);
+        av_log(ctx, AV_LOG_ERROR, "feature_name: %s\n", metadata_cfg.feature_name);
+
+        err = vmaf_register_metadata_handler(s->vmaf, metadata_cfg, VMAF_METADATA_FLAG_FEATURE);
+        if (err) {
+            av_log(ctx, AV_LOG_ERROR,
+                   "problem during vmaf_register_metadata_handler: %s\n",
+                   metadata_cfg.feature_name);
+            goto exit;
+        }
+
+        err = vmaf_get_metadata_handler_count(s->vmaf,  &s->metadata_cfg_cnt);
+        if (err) {
+            av_log(ctx, AV_LOG_ERROR,
+                 "problem during vmaf_get_metadata_handler_count: %d\n",
+                 s->metadata_cfg_cnt);
+            goto exit;
+        }
+        #endif
     }
 
 exit:
@@ -529,6 +553,29 @@ static int parse_models(AVFilterContext *ctx)
             goto exit;
         }
 
+        #if CONFIG_LIBVMAF_METADATA_ENABLED
+        VmafMetadataConfiguration metadata_cfg = {0};
+        metadata_cfg.data = s->cb;
+        metadata_cfg.callback = &set_meta;
+        metadata_cfg.feature_name = model_cfg.name ? av_strdup(model_cfg.name) : av_strdup("vmaf");
+
+        err = vmaf_register_metadata_handler(s->vmaf, metadata_cfg, VMAF_METADATA_FLAG_MODEL);
+        if (err) {
+            av_log(ctx, AV_LOG_ERROR,
+                   "problem during vmaf_register_metadata_handler: %s\n",
+                   metadata_cfg.feature_name);
+            goto exit;
+        }
+
+        err = vmaf_get_metadata_handler_count(s->vmaf,  &s->metadata_cfg_cnt);
+        if (err) {
+            av_log(ctx, AV_LOG_ERROR,
+                 "problem during vmaf_get_metadata_handler_count: %d\n",
+                 s->metadata_cfg_cnt);
+            goto exit;
+        }
+        #endif
+
         while (e = av_dict_iterate(dict[i], e)) {
             VmafFeatureDictionary *feature_opts_dict = NULL;
             char *feature_opt = NULL;
@@ -576,70 +623,7 @@ exit:
     av_free(dict);
     return err;
 }
-
 #if CONFIG_LIBVMAF_METADATA_ENABLED
-static int parse_metadata_handlers(AVFilterContext *ctx)
-{
-    LIBVMAFContext *s = ctx->priv;
-    AVDictionary **dict;
-    unsigned dict_cnt;
-    int err = 0;
-
-    if (!s->metadata_feature_cfg)
-        return 0;
-
-    dict_cnt = 0;
-    dict = delimited_dict_parse(s->metadata_feature_cfg, &dict_cnt);
-    if (!dict) {
-        av_log(ctx, AV_LOG_ERROR,
-               "could not parse metadata feature config: %s\n",
-               s->metadata_feature_cfg);
-        return AVERROR(EINVAL);
-    }
-
-    for (unsigned i = 0; i < dict_cnt; i++) {
-        VmafMetadataConfiguration *metadata_cfg = av_calloc(1, sizeof(*metadata_cfg));
-        const AVDictionaryEntry *e = NULL;
-        char *feature_name = NULL;
-
-        while (e = av_dict_iterate(dict[i], e)) {
-            if (!strcmp(e->key, "name")) {
-                metadata_cfg->feature_name = av_strdup(e->value);
-                continue;
-            }
-        }
-
-        metadata_cfg->data = s->cb;
-        metadata_cfg->callback = &set_meta;
-
-        err = vmaf_register_metadata_handler(s->vmaf, *metadata_cfg);
-        if (err) {
-            av_log(ctx, AV_LOG_ERROR,
-                   "problem during vmaf_register_metadata_handler: %s\n",
-                   feature_name);
-            goto exit;
-        }
-
-        s->metadata_cfg_list.metadata_cfgs = av_realloc(s->metadata_cfg_list.metadata_cfgs,
-                                             (s->metadata_cfg_list.metadata_cfg_cnt + 1) *
-                                             sizeof(*s->metadata_cfg_list.metadata_cfgs));
-        if (!s->metadata_cfg_list.metadata_cfgs) {
-            err = AVERROR(ENOMEM);
-            goto exit;
-        }
-
-        s->metadata_cfg_list.metadata_cfgs[s->metadata_cfg_list.metadata_cfg_cnt++] = *metadata_cfg;
-    }
-
-exit:
-    for (unsigned i = 0; i < dict_cnt; i++) {
-        if (dict[i])
-            av_dict_free(&dict[i]);
-    }
-    av_free(dict);
-    return err;
-}
-
 static int init_metadata(AVFilterContext *ctx)
 {
     LIBVMAFContext *s = ctx->priv;
@@ -689,10 +673,6 @@ static av_cold int init(AVFilterContext *ctx)
 
 #if CONFIG_LIBVMAF_METADATA_ENABLED
     err = init_metadata(ctx);
-    if (err)
-        return err;
-
-    err = parse_metadata_handlers(ctx);
     if (err)
         return err;
 #endif
@@ -862,13 +842,6 @@ static av_cold void uninit(AVFilterContext *ctx)
     }
 
 #if CONFIG_LIBVMAF_METADATA_ENABLED
-    if (s->metadata_cfg_list.metadata_cfgs) {
-        for (unsigned i = 0; i < s->metadata_cfg_list.metadata_cfg_cnt; i++) {
-            av_free(s->metadata_cfg_list.metadata_cfgs[i].feature_name);
-        }
-        av_free(s->metadata_cfg_list.metadata_cfgs);
-    }
-
     err = free_frame_list(&s->cb->frame_list);
     if (err) {
         av_log(ctx, AV_LOG_ERROR,
