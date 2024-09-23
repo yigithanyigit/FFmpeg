@@ -29,10 +29,14 @@
 #include <libvmaf.h>
 
 #include "libavutil/avstring.h"
+#include "libavutil/dict.h"
+#include "libavutil/frame.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
+#include "libavutil/fifo.h"
 #include "avfilter.h"
+#include "filters.h"
 #include "drawutils.h"
 #include "filters.h"
 #include "formats.h"
@@ -46,6 +50,31 @@
 #include "libavutil/hwcontext_cuda_internal.h"
 #endif
 
+#ifndef CONFIG_LIBVMAF_METADATA_ENABLED
+#define CONFIG_LIBVMAF_METADATA_ENABLED 0
+#endif
+
+#if CONFIG_LIBVMAF_METADATA_ENABLED
+#include <stdatomic.h>
+
+#define FIFO_ELEMS 64
+
+typedef struct VmafFrame {
+    AVFrame *frame;
+    unsigned frame_number;
+    unsigned propagated_handlers_cnt;
+} VmafFrame;
+
+typedef struct FifoPrivate {
+    VmafFrame *data[FIFO_ELEMS];
+    size_t rptr;
+} FifoPrivate;
+
+typedef struct CallbackStruct {
+    struct LIBVMAFContext *s;
+} CallbackStruct;
+#endif
+
 typedef struct LIBVMAFContext {
     const AVClass *class;
     FFFrameSync fs;
@@ -56,8 +85,17 @@ typedef struct LIBVMAFContext {
     int n_subsample;
     char *model_cfg;
     char *feature_cfg;
+#if CONFIG_LIBVMAF_METADATA_ENABLED
+    int metadata_handler;
+    AVFifo *frame_fifo;
+    unsigned metadata_cfg_cnt;
+    CallbackStruct *cb;
+    atomic_uint outlink_eof;
+    atomic_uint eof_frame;
+#endif
     VmafContext *vmaf;
     VmafModel **model;
+    int flushed;
     unsigned model_cnt;
     unsigned frame_cnt;
     unsigned bpc;
@@ -77,6 +115,9 @@ static const AVOption libvmaf_options[] = {
     {"n_subsample", "Set interval for frame subsampling used when computing vmaf.",     OFFSET(n_subsample), AV_OPT_TYPE_INT, {.i64=1}, 1, UINT_MAX, FLAGS},
     {"model",  "Set the model to be used for computing vmaf.",                          OFFSET(model_cfg), AV_OPT_TYPE_STRING, {.str="version=vmaf_v0.6.1"}, 0, 1, FLAGS},
     {"feature",  "Set the feature to be used for computing vmaf.",                      OFFSET(feature_cfg), AV_OPT_TYPE_STRING, {.str=NULL}, 0, 1, FLAGS},
+#if CONFIG_LIBVMAF_METADATA_ENABLED
+    {"metadata_handler",  "Set the feature to be propagated as metadata.",              OFFSET(metadata_handler), AV_OPT_TYPE_INT, {.i64=0},0, 1, FLAGS},
+#endif
     { NULL }
 };
 
@@ -104,6 +145,88 @@ static enum VmafPixelFormat pix_fmt_map(enum AVPixelFormat av_pix_fmt)
         return VMAF_PIX_FMT_UNKNOWN;
     }
 }
+
+#if CONFIG_LIBVMAF_METADATA_ENABLED
+static int write_from_fifo(void* opaque, void *data, size_t *size)
+{
+    FifoPrivate *fp;
+    uint8_t *data_ptr;
+
+    if (!opaque) AVERROR(EINVAL);
+
+    fp = opaque;
+
+    data_ptr = data;
+
+    if (*size + fp->rptr >= FIFO_ELEMS) return AVERROR(EINVAL);
+
+    for (int i = 0; i < *size; i++) {
+        fp->data[fp->rptr++] = (VmafFrame *)data_ptr;
+        data_ptr += sizeof(VmafFrame);
+    }
+
+    return 0;
+}
+
+static void set_meta(void *data, VmafMetadata *metadata)
+{
+    int err = 0;
+    VmafFrame first_frame = {0};
+    FifoPrivate fp = {0};
+    CallbackStruct *cb = data;
+    char value[128], key[128];
+    size_t nb_elems, last_elem;
+
+    if (atomic_load(&cb->s->outlink_eof)) return;
+
+    snprintf(value, sizeof(value), "%0.2f", metadata->score);
+    snprintf(key, sizeof(key), "%s.%d", metadata->feature_name, metadata->picture_index);
+
+    av_log(cb->s->fs.parent, AV_LOG_DEBUG, "metadata: %s=%s\n", key, value);
+
+    err = av_fifo_peek(cb->s->frame_fifo, &first_frame, 1, 0);
+    if (err) {
+        av_log(NULL, AV_LOG_ERROR, "some problem occured while doing av_fifo_peek\n");
+        return;
+    }
+
+    nb_elems = metadata->picture_index - first_frame.frame_number + 1;
+    last_elem = nb_elems - 1;
+
+    err = av_fifo_peek_to_cb(cb->s->frame_fifo, write_from_fifo, &fp, &nb_elems ,0);
+    if (err) {
+        av_log(NULL, AV_LOG_ERROR, "some problem occured while doing av_fifo_peek_to_cb\n");
+        return;
+    }
+
+    err = av_dict_set(&fp.data[last_elem]->frame->metadata, key, value, 0);
+    if (err < 0)
+        av_log(NULL, AV_LOG_ERROR, "could not set metadata: %s\n", key);
+
+    fp.data[last_elem]->propagated_handlers_cnt++;
+
+    for (int i = 0; i < nb_elems; i++) {
+          if (fp.data[i]->propagated_handlers_cnt == cb->s->metadata_cfg_cnt) {
+            // Seperate if for atomic_load
+            if (!atomic_load(&cb->s->outlink_eof)) {
+
+                if(ff_filter_frame(cb->s->fs.parent->outputs[0], fp.data[i]->frame)) {
+                    av_log(cb->s->fs.parent, AV_LOG_ERROR, "error while sending frame to filtergraph\n");
+                    av_fifo_drain2(cb->s->frame_fifo, 1);
+                    return;
+                }
+                av_log(cb->s->fs.parent, AV_LOG_DEBUG, "outlink_status: %d\n", ff_outlink_get_status(cb->s->fs.parent->outputs[0]));
+                // make sure the outlink is not eof
+                atomic_store(&cb->s->eof_frame, !atomic_load(&cb->s->outlink_eof) ? fp.data[i]->frame_number : atomic_load(&cb->s->eof_frame));
+                av_log(cb->s->fs.parent, AV_LOG_DEBUG, "VMAF feature: %d, score: %f\n", fp.data[i]->frame_number, metadata->score);
+                av_fifo_drain2(cb->s->frame_fifo, 1);
+            }
+        } else {
+            break;
+        }
+    }
+}
+#endif
 
 static int copy_picture_data(AVFrame *src, VmafPicture *dst, unsigned bpc)
 {
@@ -160,13 +283,36 @@ static int do_vmaf(FFFrameSync *fs)
         return AVERROR(ENOMEM);
     }
 
+#if CONFIG_LIBVMAF_METADATA_ENABLED
+    if (s->metadata_handler) {
+        VmafFrame vmaf_frame = {
+            .frame = dist,
+            .frame_number = s->frame_cnt,
+            .propagated_handlers_cnt = 0
+        };
+
+        err = av_fifo_write(s->frame_fifo, &vmaf_frame, 1);
+        if (err) {
+            av_log(s, AV_LOG_ERROR, "problem during av_fifo_write.\n");
+            return AVERROR(ENOMEM);
+        }
+    }
+#endif
+
     err = vmaf_read_pictures(s->vmaf, &pic_ref, &pic_dist, s->frame_cnt++);
     if (err) {
         av_log(s, AV_LOG_ERROR, "problem during vmaf_read_pictures.\n");
         return AVERROR(EINVAL);
     }
 
+#if CONFIG_LIBVMAF_METADATA_ENABLED
+    if (s->metadata_cfg_cnt)
+        return 0;
+    else
+        return ff_filter_frame(ctx->outputs[0], dist);
+#else
     return ff_filter_frame(ctx->outputs[0], dist);
+#endif
 }
 
 static AVDictionary **delimited_dict_parse(char *str, unsigned *cnt)
@@ -265,6 +411,31 @@ static int parse_features(AVFilterContext *ctx)
                    "problem during vmaf_use_feature: %s\n", feature_name);
             goto exit;
         }
+
+        #if CONFIG_LIBVMAF_METADATA_ENABLED
+        if (s->metadata_handler) {
+            VmafMetadataConfiguration metadata_cfg = {0};
+            metadata_cfg.data = s->cb;
+            metadata_cfg.callback = &set_meta;
+            metadata_cfg.feature_name = av_strdup(feature_name);
+
+            err = vmaf_register_metadata_handler(s->vmaf, metadata_cfg, VMAF_METADATA_FLAG_FEATURE);
+            if (err) {
+                av_log(ctx, AV_LOG_ERROR,
+                       "problem during vmaf_register_metadata_handler: %s\n",
+                       metadata_cfg.feature_name);
+                goto exit;
+            }
+
+            err = vmaf_get_metadata_handler_count(s->vmaf,  &s->metadata_cfg_cnt);
+            if (err) {
+                av_log(ctx, AV_LOG_ERROR,
+                     "problem during vmaf_get_metadata_handler_count: %d\n",
+                     s->metadata_cfg_cnt);
+                goto exit;
+            }
+        }
+        #endif
     }
 
 exit:
@@ -360,6 +531,31 @@ static int parse_models(AVFilterContext *ctx)
             goto exit;
         }
 
+        #if CONFIG_LIBVMAF_METADATA_ENABLED
+        if (s->metadata_handler) {
+            VmafMetadataConfiguration metadata_cfg = {0};
+            metadata_cfg.data = s->cb;
+            metadata_cfg.callback = &set_meta;
+            metadata_cfg.feature_name = model_cfg.name ? av_strdup(model_cfg.name) : av_strdup("vmaf");
+
+            err = vmaf_register_metadata_handler(s->vmaf, metadata_cfg, VMAF_METADATA_FLAG_MODEL);
+            if (err) {
+                av_log(ctx, AV_LOG_ERROR,
+                       "problem during vmaf_register_metadata_handler: %s\n",
+                       metadata_cfg.feature_name);
+                goto exit;
+            }
+
+            err = vmaf_get_metadata_handler_count(s->vmaf,  &s->metadata_cfg_cnt);
+            if (err) {
+                av_log(ctx, AV_LOG_ERROR,
+                     "problem during vmaf_get_metadata_handler_count: %d\n",
+                     s->metadata_cfg_cnt);
+                goto exit;
+            }
+        }
+        #endif
+
         while (e = av_dict_iterate(dict[i], e)) {
             VmafFeatureDictionary *feature_opts_dict = NULL;
             char *feature_opt = NULL;
@@ -407,6 +603,24 @@ exit:
     av_free(dict);
     return err;
 }
+#if CONFIG_LIBVMAF_METADATA_ENABLED
+static int init_metadata(AVFilterContext *ctx)
+{
+    LIBVMAFContext *s = ctx->priv;
+
+    s->cb = av_calloc(1, sizeof(CallbackStruct));
+    if (!s->cb)
+        return AVERROR(ENOMEM);
+
+    s->cb->s = s;
+
+    s->frame_fifo = av_fifo_alloc2(FIFO_ELEMS, sizeof(VmafFrame), 0);
+    if (!s->frame_fifo)
+        return AVERROR(ENOMEM);
+
+    return 0;
+}
+#endif
 
 static enum VmafLogLevel log_level_map(int log_level)
 {
@@ -440,6 +654,14 @@ static av_cold int init(AVFilterContext *ctx)
     err = vmaf_init(&s->vmaf, cfg);
     if (err)
         return AVERROR(EINVAL);
+
+#if CONFIG_LIBVMAF_METADATA_ENABLED
+    if (s->metadata_handler) {
+        err = init_metadata(ctx);
+        if (err)
+            return err;
+    }
+#endif
 
     err = parse_models(ctx);
     if (err)
@@ -518,6 +740,38 @@ static int config_output(AVFilterLink *outlink)
 static int activate(AVFilterContext *ctx)
 {
     LIBVMAFContext *s = ctx->priv;
+#if CONFIG_LIBVMAF_METADATA_ENABLED
+    // There are 2 cases for metadata propagation:
+    // 1. Where the case that outlink closes
+    // 2. Where inlink closes
+    // Case 1:
+    //   In this case we need check outlink somehow for the status in every iteration.
+    //   If outlink is not wanting frame anymore, we need to proceed with uninit with setting inlink.
+    //   But nature of multithreading settting eof inside the activate call can make sync issues and
+    //   can lead to extra propagated frames. Atomic variables are used to avoid this.
+    // Case 2:
+    //   This case relatively easy to handle. Because of calculation of vmaf score takes time
+    //   So `do_vmaf` buffers many of frames before sending to outlink that causes
+    //   premature close of outlink.
+    //   Checking inlink status is enough and if inlink == eof flushing vmaf is enough for this.
+    int64_t pts;
+    int status, ret = 0;
+
+    if (ff_outlink_get_status(ctx->outputs[0]))
+        atomic_store(&s->outlink_eof, 1);
+
+    if (ff_inlink_acknowledge_status(ctx->inputs[0], &status, &pts) && 
+        ff_inlink_acknowledge_status(ctx->inputs[1], &status, &pts)) {
+        if (!s->flushed) {
+            ret = vmaf_read_pictures(s->vmaf, NULL, NULL, 0);
+            if (ret) 
+                av_log(ctx, AV_LOG_ERROR,
+                       "problem flushing libvmaf context.\n");
+            else
+                s->flushed = 1;
+        }
+    }
+#endif
     return ff_framesync_activate(&s->fs);
 }
 
@@ -556,21 +810,42 @@ static av_cold void uninit(AVFilterContext *ctx)
     LIBVMAFContext *s = ctx->priv;
     int err = 0;
 
+#if CONFIG_LIBVMAF_METADATA_ENABLED
+        atomic_store(&s->outlink_eof , 1);
+#endif
+
     ff_framesync_uninit(&s->fs);
 
     if (!s->frame_cnt)
         goto clean_up;
 
-    err = vmaf_read_pictures(s->vmaf, NULL, NULL, 0);
-    if (err) {
-        av_log(ctx, AV_LOG_ERROR,
-               "problem flushing libvmaf context.\n");
+    if (!s->flushed) {
+        err = vmaf_read_pictures(s->vmaf, NULL, NULL, 0);
+        if (err) {
+            av_log(ctx, AV_LOG_ERROR,
+                   "problem flushing libvmaf context.\n");
+        } else
+            s->flushed = 1;
     }
+
+#if CONFIG_LIBVMAF_METADATA_ENABLED
+    if (s->metadata_handler)
+        av_fifo_freep2(&s->frame_fifo);
+#endif
 
     for (unsigned i = 0; i < s->model_cnt; i++) {
         double vmaf_score;
+
+#if CONFIG_LIBVMAF_METADATA_ENABLED
+        err = vmaf_score_pooled(s->vmaf, s->model[i], pool_method_map(s->pool),
+                                &vmaf_score, 0, atomic_load(&s->eof_frame) == 0 ? s->frame_cnt - 1 : atomic_load(&s->eof_frame));
+        av_log(ctx, AV_LOG_DEBUG, "frame: %d frame_cnt %d\n",
+               atomic_load(&s->eof_frame) == 0 ? s->frame_cnt - 1 : atomic_load(&s->eof_frame), s->frame_cnt - 1);
+#else
         err = vmaf_score_pooled(s->vmaf, s->model[i], pool_method_map(s->pool),
                                 &vmaf_score, 0, s->frame_cnt - 1);
+#endif
+
         if (err) {
             av_log(ctx, AV_LOG_ERROR,
                    "problem getting pooled vmaf score.\n");
